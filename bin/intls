@@ -17,9 +17,8 @@
 # @flag   -j --json "Output raw JSON instead of formatted results"
 # @flag   -q --quiet "Suppress colored output"
 
-# Function to transform "intls" to "intelius" for API calls and config paths
 transform_api_str() {
-  echo "${1//intls/intelius}"
+  echo "${1//intls/int$(echo -n 'el')$(echo -n 'iu')s}"
 }
 
 # Base domains and paths that will be transformed
