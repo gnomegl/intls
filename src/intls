@@ -28,14 +28,6 @@ WEB_DOMAIN="www.intls.com"
 
 eval "$(argc --argc-eval "$0" "$@")"
 
-argc_quiet=0
-argc_json=0
-argc_email=""
-argc_password=""
-argc_device_id=""
-argc_session_id=""
-argc_api_key=""
-
 setup_colors() {
   if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
     bold="" reset="" green="" yellow="" cyan="" red=""
@@ -150,8 +142,217 @@ make_request() {
     -H 'Cache-Control: no-cache'
 }
 
+make_post_request() {
+  local api_url="$1"
+  local referer="$2"
+  local access_token="$3"
+  local data="$4"
+
+  curl -s "$api_url" --compressed -X POST \
+    -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36' \
+    -H 'Accept: */*' \
+    -H 'Accept-Language: en-US,en;q=0.5' \
+    -H 'Accept-Encoding: gzip, deflate, br' \
+    -H "Referer: $referer" \
+    -H "api-key: $INTLS_API_KEY" \
+    -H "app-id: $(transform_api_str intls)-web" \
+    -H "authorization: Bearer $access_token" \
+    -H "device-id: $INTLS_DEVICE_ID" \
+    -H "Origin: https://$(transform_api_str $WEB_DOMAIN)" \
+    -H 'Connection: keep-alive' \
+    -H "Cookie: sessionId=$INTLS_SESSION_ID; device-id=$INTLS_DEVICE_ID;" \
+    -H 'content-type: application/json' \
+    -H 'Sec-Fetch-Dest: empty' \
+    -H 'Sec-Fetch-Mode: cors' \
+    -H 'Sec-Fetch-Site: same-site' \
+    -H 'Priority: u=4' \
+    -H 'Pragma: no-cache' \
+    -H 'Cache-Control: no-cache' \
+    --data-raw "$data"
+}
+
 urlencode() {
   echo "${1// /%20}"
+}
+
+get_age_from_dob() {
+  local dob="$1"
+  if [[ "$dob" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+    local year="${dob%-*}"
+    local current_year=$(date +%Y)
+    echo $((current_year - year))
+  else
+    echo "Unknown"
+  fi
+}
+
+format_phone_hint() {
+  local phone="$1"
+  if [[ "$phone" =~ XXXXXX([0-9]{4}) ]]; then
+    echo "***-***-${BASH_REMATCH[1]}"
+  else
+    echo "$phone"
+  fi
+}
+
+display_person_selection() {
+  local people_json="$1"
+
+  # check if response is valid json first
+  if ! echo "$people_json" | jq . >/dev/null 2>&1; then
+    echo "${red}Error: Invalid response from API${reset}" >&2
+    echo "Response: $people_json" >&2
+    return 1
+  fi
+
+  local count
+  count=$(echo "$people_json" | jq '. | length')
+
+  if [ "$count" -eq 0 ]; then
+    echo "${red}No people found.${reset}" >&2
+    return 1
+  fi
+
+  if [ "$count" -eq 1 ]; then
+    echo "${green}Found 1 person. Auto-selecting...${reset}" >&2
+    echo "0"
+    return 0
+  fi
+
+  echo "${bold}Found $count people:${reset}" >&2
+  echo "" >&2
+
+  for i in $(seq 0 $((count - 1))); do
+    local person
+    person=$(echo "$people_json" | jq ".[$i]")
+
+    # extract basic info
+    local name=$(echo "$person" | jq -r '.names[0] | "\(.first // "") \(.middle // "") \(.last // "")" | gsub("  "; " ") | gsub("^ | $"; "")')
+    local dob=$(echo "$person" | jq -r '.dob // ""')
+    local age=$(get_age_from_dob "$dob")
+
+    # extract location info
+    local location=""
+    if echo "$person" | jq -e '.locations[0]' >/dev/null 2>&1; then
+      local city=$(echo "$person" | jq -r '.locations[0].address.city // ""')
+      local state=$(echo "$person" | jq -r '.locations[0].address.state_code // ""')
+      if [ -n "$city" ] && [ -n "$state" ]; then
+        location="$city, $state"
+      elif [ -n "$city" ]; then
+        location="$city"
+      elif [ -n "$state" ]; then
+        location="$state"
+      fi
+    fi
+
+    # extract phone hints
+    local phone_hints=""
+    if echo "$person" | jq -e '.phones[0]' >/dev/null 2>&1; then
+      local phone1=$(echo "$person" | jq -r '.phones[0].number // ""')
+      local phone2=$(echo "$person" | jq -r '.phones[1].number // ""')
+
+      if [ -n "$phone1" ]; then
+        phone_hints=$(format_phone_hint "$phone1")
+        if [ -n "$phone2" ]; then
+          phone_hints="$phone_hints, $(format_phone_hint "$phone2")"
+        fi
+      fi
+    fi
+
+    printf "${bold}%d.${reset} %s" "$((i + 1))" "$name" >&2
+    if [ -n "$age" ] && [ "$age" != "Unknown" ]; then
+      printf " (Age: %s)" "$age" >&2
+    fi
+    if [ -n "$location" ]; then
+      printf " - %s" "$location" >&2
+    fi
+    if [ -n "$phone_hints" ]; then
+      printf " - %s" "$phone_hints" >&2
+    fi
+    echo "" >&2
+  done
+
+  echo "" >&2
+  printf "${bold}Select a person (1-$count):${reset} " >&2
+  read -r selection
+
+  if [[ "$selection" =~ ^[0-9]+$ ]] && [ "$selection" -ge 1 ] && [ "$selection" -le "$count" ]; then
+    echo $((selection - 1))
+    return 0
+  else
+    echo "${red}Invalid selection.${reset}" >&2
+    return 1
+  fi
+}
+
+get_person_report() {
+  local people_json="$1"
+  local selected_index="$2"
+  local access_token="$3"
+
+  local person
+  person=$(echo "$people_json" | jq ".[$selected_index]")
+
+  local tcg_id
+  tcg_id=$(echo "$person" | jq -r '.tcg_id')
+
+  local search_pointer
+  search_pointer=$(echo "$person" | jq -r '.searchPointer')
+
+  # get the first name/location/dob for the record creation
+  local first_name
+  first_name=$(echo "$person" | jq -r '.names[0]')
+
+  local first_location
+  first_location=$(echo "$person" | jq -r '.locations[0]')
+
+  local first_dob
+  first_dob=$(echo "$person" | jq -r '.dobs[0]')
+
+  echo "${yellow}Generating report for selected person...${reset}" >&2
+
+  # step 1: send navigation event
+  local nav_data="{\"name\":\"navigation:view\",\"page\":{\"host\":\"$(transform_api_str $WEB_DOMAIN)\",\"path\":\"\/dashboard\/reports\/$tcg_id\",\"route\":\"\/dashboard\/reports\/:recordId\"}}"
+  local nav_response
+  nav_response=$(make_post_request "https://$(transform_api_str $API_DOMAIN)/v1/events" \
+    "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$tcg_id" \
+    "$access_token" \
+    "$nav_data")
+
+  # step 2: create record
+  local record_data
+  record_data=$(jq -nc \
+    --arg pointer "$search_pointer" \
+    --argjson name "$first_name" \
+    --argjson location "$first_location" \
+    --argjson dob "$first_dob" \
+    --arg tcg_id "$tcg_id" \
+    '{
+      "data": {
+        "pointer": $pointer,
+        "name": $name,
+        "location": {"address": $location.address},
+        "dobs": $dob,
+        "tcg_id": $tcg_id
+      },
+      "type": "person"
+    }')
+
+  # tbh i am not sure that we actually need the response at all, seems like we just need to call it to trigger the report to generate. its sneed
+  local record_response
+  record_response=$(make_post_request "https://$(transform_api_str $API_DOMAIN)/v1/me/records" \
+    "https://$(transform_api_str $WEB_DOMAIN)/dashboard/create-record?type=person&tcgId=$tcg_id&pointer=$(urlencode "$search_pointer")" \
+    "$access_token" \
+    "$record_data")
+
+  # step 3: get the full report, u have to wait for the above query to finish whatever async crap it set up in the intelius side
+  echo "${yellow}Fetching detailed report (this may take a moment)...${reset}" >&2
+  local report_response
+  report_response=$(make_request "https://$(transform_api_str $API_DOMAIN)/v1/me/records/$tcg_id/report?defer_extended_data=false" \
+    "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$tcg_id" \
+    "$access_token")
+
+  echo "$report_response"
 }
 
 show_help() {
@@ -246,9 +447,19 @@ people)
   fi
 
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/people?$query_params"
-  referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?name=$(urlencode "$argc_value $argc_last_name")"
+  referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?firstName=$argc_value&lastName=$argc_last_name&state=$argc_state"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
-  [ "$argc_json" = 1 ] && echo "$response" | jq . || echo "$response"
+
+  if [ "$argc_json" = 1 ]; then
+    echo "$response" | jq .
+  else
+    # show person selection and get detailed report
+    selected_index=$(display_person_selection "$response")
+    if [ $? -eq 0 ]; then
+      detailed_report=$(get_person_report "$response" "$selected_index" "$ACCESS_TOKEN")
+      echo "$detailed_report" | jq .
+    fi
+  fi
   ;;
 
 address)
