@@ -419,7 +419,7 @@ phone)
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/phones/$argc_value"
   referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?phone=$argc_value"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
-  echo "$response" | jq .
+  echo "$response" | jq --indent 2 --color-output .
   ;;
 
 email)
@@ -435,7 +435,7 @@ email)
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/emails/$argc_value"
   referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?email=$argc_value"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
-  echo "$response" | jq .
+  echo "$response" | jq --indent 2 --color-output .
   ;;
 
 people)
@@ -486,7 +486,7 @@ address)
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/locations?$query_params"
   referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?address=$(urlencode "$argc_street $argc_city $argc_state")"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
-  echo "$response" | jq .
+  echo "$response" | jq --indent 2 --color-output .
   ;;
 
 *)
