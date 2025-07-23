@@ -15,20 +15,21 @@
 # @option --session-id "Session ID (can also use INTLS_SESSION_ID env var)" [string]
 # @option -k --api-key "API key (can also use INTLS_API_KEY env var)" [string]
 # @flag   -q --quiet "Suppress colored output"
+# @flag   -v --verbose "Show verbose output (include provider, data_point_id, tcg_id, search_pointer fields)"
+# @flag   -C --compact "Compact JSON output (single line)"
 
 transform_api_str() {
   echo "${1//intls/int$(echo -n 'el')$(echo -n 'iu')s}"
 }
 
-# Base domains and paths that will be transformed
 CONFIG_DIR="intls"
 API_DOMAIN="api.intls.com"
 WEB_DOMAIN="www.intls.com"
 
 eval "$(argc --argc-eval "$0" "$@")"
-
-# Initialize argc variables with defaults to avoid shellcheck warnings
 argc_quiet=${argc_quiet:-0}
+argc_verbose=${argc_verbose:-0}
+argc_compact=${argc_compact:-0}
 argc_email=${argc_email:-""}
 argc_password=${argc_password:-""}
 argc_device_id=${argc_device_id:-""}
@@ -389,6 +390,32 @@ show_help() {
   echo "  ${yellow}INTLS_SESSION_ID, INTLS_API_KEY${reset}"
 }
 
+filter_json_output() {
+  local input="$1"
+  local jq_filter=""
+  local jq_options=""
+
+  # Apply verbose filtering unless verbose flag is set
+  if [ "$argc_verbose" != 1 ]; then
+    jq_filter="walk(if type == \"object\" then del(.provider, .data_point_id, .tcg_id, .search_pointer) else . end)"
+  else
+    jq_filter="."
+  fi
+
+  # Apply compact formatting if compact flag is set
+  if [ "$argc_compact" = 1 ]; then
+    jq_options="-c"
+  else
+    jq_options="--indent 2"
+    # Only add color output if not compact and not quiet
+    if [ "$argc_quiet" != 1 ]; then
+      jq_options="$jq_options --color-output"
+    fi
+  fi
+
+  echo "$input" | jq $jq_options "$jq_filter"
+}
+
 validate_phone() {
   local phone="$1"
   if [[ "$phone" == +1* ]]; then
@@ -419,7 +446,7 @@ phone)
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/phones/$argc_value"
   referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?phone=$argc_value"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
-  echo "$response" | jq --indent 2 --color-output .
+  filter_json_output "$response"
   ;;
 
 email)
@@ -435,7 +462,7 @@ email)
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/emails/$argc_value"
   referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?email=$argc_value"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
-  echo "$response" | jq --indent 2 --color-output .
+  filter_json_output "$response"
   ;;
 
 people)
@@ -467,7 +494,7 @@ people)
   selected_index=$(display_person_selection "$response")
   if [ $? -eq 0 ]; then
     detailed_report=$(get_person_report "$response" "$selected_index" "$ACCESS_TOKEN")
-    echo "$detailed_report" | jq .
+    filter_json_output "$detailed_report"
   fi
   ;;
 
@@ -486,7 +513,7 @@ address)
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/locations?$query_params"
   referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?address=$(urlencode "$argc_street $argc_city $argc_state")"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
-  echo "$response" | jq --indent 2 --color-output .
+  filter_json_output "$response"
   ;;
 
 *)
