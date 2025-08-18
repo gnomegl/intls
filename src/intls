@@ -407,8 +407,8 @@ filter_json_output() {
     jq_options="-c"
   else
     jq_options="--indent 2"
-    # Only add color output if not compact and not quiet
-    if [ "$argc_quiet" != 1 ]; then
+    # Only add color output if not compact, not quiet, and output is to a terminal
+    if [ "$argc_quiet" != 1 ] && [ -t 1 ]; then
       jq_options="$jq_options --color-output"
     fi
   fi
