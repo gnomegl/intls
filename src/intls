@@ -14,6 +14,7 @@
 # @option -d --device-id "Device ID (can also use INTLS_DEVICE_ID env var)" [string]
 # @option --session-id "Session ID (can also use INTLS_SESSION_ID env var)" [string]
 # @option -k --api-key "API key (can also use INTLS_API_KEY env var)" [string]
+# @option -x --proxy "Proxy URL (can also use INTLS_PROXY env var)" [string]
 # @flag   -q --quiet "Suppress colored output"
 # @flag   -v --verbose "Show verbose output (include provider, data_point_id, tcg_id, search_pointer fields)"
 # @flag   -C --compact "Compact JSON output (single line)"
@@ -35,6 +36,7 @@ argc_password=${argc_password:-""}
 argc_device_id=${argc_device_id:-""}
 argc_session_id=${argc_session_id:-""}
 argc_api_key=${argc_api_key:-""}
+argc_proxy=${argc_proxy:-""}
 
 setup_colors() {
   if [ "$argc_quiet" = 1 ] || [ -z "$TERM" ] || [ "$TERM" = "dumb" ]; then
@@ -82,6 +84,27 @@ INTLS_DEVICE_ID=$(get_credential "device-id" "INTLS_DEVICE_ID" "device_id")
 INTLS_SESSION_ID=$(get_credential "session-id" "INTLS_SESSION_ID" "session_id")
 INTLS_API_KEY=$(get_credential "api-key" "INTLS_API_KEY" "api_key")
 
+# Proxy is optional - check arg, then env, then config file
+if [ -n "$argc_proxy" ]; then
+  INTLS_PROXY="$argc_proxy"
+elif [ -n "${INTLS_PROXY:-}" ]; then
+  INTLS_PROXY="$INTLS_PROXY"
+elif [ -f "$HOME/.config/$(transform_api_str $CONFIG_DIR)/proxy" ]; then
+  INTLS_PROXY=$(cat "$HOME/.config/$(transform_api_str $CONFIG_DIR)/proxy")
+else
+  INTLS_PROXY=""
+fi
+
+# Build curl proxy args
+CURL_PROXY_ARGS=""
+if [ -n "$INTLS_PROXY" ]; then
+  CURL_PROXY_ARGS="-x $INTLS_PROXY"
+fi
+
+# Create cookie jar for session management
+COOKIE_JAR=$(mktemp)
+trap "rm -f $COOKIE_JAR" EXIT
+
 print_kv() {
   printf "${bold}%s:${reset} %s\n" "$1" "$2"
 }
@@ -92,7 +115,9 @@ print_section() {
 
 authenticate() {
   local auth_resp
-  auth_resp=$(curl -s "https://$(transform_api_str $API_DOMAIN)/v1/authenticate" --compressed -X POST \
+  auth_resp=$(curl -s $CURL_PROXY_ARGS "https://$(transform_api_str $API_DOMAIN)/v1/authenticate" --compressed -X POST \
+    -c "$COOKIE_JAR" \
+    -b "sessionId=$INTLS_SESSION_ID; device-id=$INTLS_DEVICE_ID;" \
     -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36' \
     -H 'Accept: */*' \
     -H 'Accept-Language: en-US,en;q=0.5' \
@@ -129,7 +154,8 @@ make_request() {
   local referer="$2"
   local access_token="$3"
 
-  curl -s "$api_url" --compressed \
+  curl -s $CURL_PROXY_ARGS "$api_url" --compressed \
+    -b "$COOKIE_JAR" \
     -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36' \
     -H 'Accept: */*' \
     -H 'Accept-Language: en-US,en;q=0.5' \
@@ -141,7 +167,6 @@ make_request() {
     -H "device-id: $INTLS_DEVICE_ID" \
     -H "Origin: https://$(transform_api_str $WEB_DOMAIN)" \
     -H 'Connection: keep-alive' \
-    -H "Cookie: sessionId=$INTLS_SESSION_ID; device-id=$INTLS_DEVICE_ID;" \
     -H 'Sec-Fetch-Dest: empty' \
     -H 'Sec-Fetch-Mode: cors' \
     -H 'Sec-Fetch-Site: same-site' \
@@ -156,7 +181,8 @@ make_post_request() {
   local access_token="$3"
   local data="$4"
 
-  curl -s "$api_url" --compressed -X POST \
+  curl -s $CURL_PROXY_ARGS "$api_url" --compressed -X POST \
+    -b "$COOKIE_JAR" \
     -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36' \
     -H 'Accept: */*' \
     -H 'Accept-Language: en-US,en;q=0.5' \
@@ -168,7 +194,6 @@ make_post_request() {
     -H "device-id: $INTLS_DEVICE_ID" \
     -H "Origin: https://$(transform_api_str $WEB_DOMAIN)" \
     -H 'Connection: keep-alive' \
-    -H "Cookie: sessionId=$INTLS_SESSION_ID; device-id=$INTLS_DEVICE_ID;" \
     -H 'content-type: application/json' \
     -H 'Sec-Fetch-Dest: empty' \
     -H 'Sec-Fetch-Mode: cors' \
@@ -362,9 +387,33 @@ get_person_report() {
   # step 3: get the full report, u have to wait for the above query to finish whatever async crap it set up in the intelius side
   echo "${yellow}Fetching detailed report (this may take a moment)...${reset}" >&2
   local report_response
-  report_response=$(make_request "https://$(transform_api_str $API_DOMAIN)/v1/me/records/$tcg_id/report?defer_extended_data=false" \
-    "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$tcg_id" \
-    "$access_token")
+  local max_retries=30
+  local retry_delay=3
+  local attempt=1
+
+  while [ $attempt -le $max_retries ]; do
+    report_response=$(make_request "https://$(transform_api_str $API_DOMAIN)/v1/me/records/$tcg_id/report?defer_extended_data=false" \
+      "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$tcg_id" \
+      "$access_token")
+
+    # Check if response is valid JSON with actual data (not a 404 or error)
+    if echo "$report_response" | jq -e '.person' >/dev/null 2>&1; then
+      break
+    fi
+
+    # Check for plain text "404" response or JSON error - report still generating
+    if [ "$report_response" = "404" ] || echo "$report_response" | jq -e '.statusCode == 404 or .error' >/dev/null 2>&1; then
+      if [ $attempt -lt $max_retries ]; then
+        echo "${yellow}Report still generating, retrying in ${retry_delay}s (attempt $attempt/$max_retries)...${reset}" >&2
+        sleep $retry_delay
+        ((attempt++))
+        continue
+      fi
+    fi
+
+    # If we get here with valid JSON that's not a 404, break out
+    break
+  done
 
   echo "$report_response"
 }
@@ -399,6 +448,7 @@ show_help() {
   echo "  ${cyan}-d, --device-id${reset} Device ID (can also use INTLS_DEVICE_ID env var)"
   echo "  ${cyan}--session-id${reset}    Session ID (can also use INTLS_SESSION_ID env var)"
   echo "  ${cyan}-k, --api-key${reset}   API key (can also use INTLS_API_KEY env var)"
+  echo "  ${cyan}-x, --proxy${reset}     Proxy URL (can also use INTLS_PROXY env var)"
   echo ""
   echo "${bold}Output Options:${reset}"
   echo "  ${cyan}-q, --quiet${reset}     Suppress colored output"
@@ -415,8 +465,8 @@ show_help() {
   echo ""
   echo "${bold}Authentication:${reset}"
   echo "  You can provide credentials via command line options, environment variables, or config files:"
-  echo "  ${yellow}Environment variables:${reset} INTLS_EMAIL, INTLS_PASSWORD, INTLS_DEVICE_ID, INTLS_SESSION_ID, INTLS_API_KEY"
-  echo "  ${yellow}Config files:${reset} ~/.config/intelius/{email,password,device_id,session_id,api_key}"
+  echo "  ${yellow}Environment variables:${reset} INTLS_EMAIL, INTLS_PASSWORD, INTLS_DEVICE_ID, INTLS_SESSION_ID, INTLS_API_KEY, INTLS_PROXY"
+  echo "  ${yellow}Config files:${reset} ~/.config/intelius/{email,password,device_id,session_id,api_key,proxy}"
 }
 
 filter_json_output() {
