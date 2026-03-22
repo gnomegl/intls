@@ -339,43 +339,69 @@ get_person_report() {
   search_pointer=$(echo "$person" | jq -r '.searchPointer')
 
   # get the first name/location/dob for the record creation
-  local first_name
-  first_name=$(echo "$person" | jq -r '.names[0]')
+  local first_name_first
+  first_name_first=$(echo "$person" | jq -r '.names[0].first // ""')
+  local first_name_last
+  first_name_last=$(echo "$person" | jq -r '.names[0].last // ""')
+  local first_name_middle
+  first_name_middle=$(echo "$person" | jq -r '.names[0].middle // ""')
 
-  local first_location
-  first_location=$(echo "$person" | jq -r '.locations[0]')
+  local has_location
+  has_location=$(echo "$person" | jq -e '.locations[0]' >/dev/null 2>&1 && echo "true" || echo "false")
 
-  local first_dob
-  first_dob=$(echo "$person" | jq -r '.dobs[0]')
+  local has_dobs
+  has_dobs=$(echo "$person" | jq -e '.dobs[0]' >/dev/null 2>&1 && echo "true" || echo "false")
 
   echo "${yellow}Generating report for selected person...${reset}" >&2
 
-  # step 1: send navigation event
+  # step 1: send navigation event (best-effort, non-fatal if it fails)
   local nav_data="{\"name\":\"navigation:view\",\"page\":{\"host\":\"$(transform_api_str $WEB_DOMAIN)\",\"path\":\"\/dashboard\/reports\/$tcg_id\",\"route\":\"\/dashboard\/reports\/:recordId\"}}"
   local nav_response
   nav_response=$(make_post_request "https://$(transform_api_str $API_DOMAIN)/v1/events" \
     "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$tcg_id" \
     "$access_token" \
-    "$nav_data")
+    "$nav_data" 2>/dev/null || true)
 
   # step 2: create record
+  # Build payload carefully - only include fields that exist in search data.
+  # Including "dobs": null causes "Invalid new record parameters" from the API.
   local record_data
   record_data=$(jq -nc \
     --arg pointer "$search_pointer" \
-    --argjson name "$first_name" \
-    --argjson location "$first_location" \
-    --argjson dob "$first_dob" \
     --arg tcg_id "$tcg_id" \
+    --arg first "$first_name_first" \
+    --arg last "$first_name_last" \
+    --arg middle "$first_name_middle" \
     '{
       "data": {
         "pointer": $pointer,
-        "name": $name,
-        "location": {"address": $location.address},
-        "dobs": $dob,
+        "name": {"first": $first, "last": $last, "middle": $middle},
         "tcg_id": $tcg_id
       },
       "type": "person"
     }')
+
+  # Add location if available
+  if [ "$has_location" = "true" ]; then
+    local loc_street loc_city loc_state_code loc_zip
+    loc_street=$(echo "$person" | jq -r '.locations[0].address.street // ""')
+    loc_city=$(echo "$person" | jq -r '.locations[0].address.city // ""')
+    loc_state_code=$(echo "$person" | jq -r '.locations[0].address.state_code // ""')
+    loc_zip=$(echo "$person" | jq -r '.locations[0].address.zip_code // ""')
+    record_data=$(echo "$record_data" | jq \
+      --arg street "$loc_street" \
+      --arg city "$loc_city" \
+      --arg state_code "$loc_state_code" \
+      --arg zip "$loc_zip" \
+      '.data.location = {"address": {"street": $street, "city": $city, "state_code": $state_code, "state": $state_code, "zip_code": $zip}}')
+  fi
+
+  # Add dobs only if present in search data
+  if [ "$has_dobs" = "true" ]; then
+    local dob_val
+    dob_val=$(echo "$person" | jq '.dobs[0]')
+    record_data=$(echo "$record_data" | jq --argjson dob "$dob_val" '.data.dobs = $dob')
+  fi
 
   # tbh i am not sure that we actually need the response at all, seems like we just need to call it to trigger the report to generate. its sneed
   local record_response
@@ -384,7 +410,14 @@ get_person_report() {
     "$access_token" \
     "$record_data")
 
-  # step 3: get the full report, u have to wait for the above query to finish whatever async crap it set up in the intelius side
+  # step 3: check if record was created successfully
+  if echo "$record_response" | grep -q "Invalid new record parameters"; then
+    echo "${red}Error: Failed to create record. API returned: $record_response${reset}" >&2
+    echo "$record_response"
+    return 1
+  fi
+
+  # step 4: get the full report, u have to wait for the above query to finish whatever async crap it set up in the intelius side
   echo "${yellow}Fetching detailed report (this may take a moment)...${reset}" >&2
   local report_response
   local max_retries=30
@@ -396,22 +429,34 @@ get_person_report() {
       "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$tcg_id" \
       "$access_token")
 
-    # Check if response is valid JSON with actual data (not a 404 or error)
-    if echo "$report_response" | jq -e '.person' >/dev/null 2>&1; then
-      break
-    fi
-
-    # Check for plain text "404" response or JSON error - report still generating
-    if [ "$report_response" = "404" ] || echo "$report_response" | jq -e '.statusCode == 404 or .error' >/dev/null 2>&1; then
+    # Check for plain text "404" response, empty response, or JSON error - report still generating
+    if [ "$report_response" = "404" ] || [ -z "$report_response" ] || echo "$report_response" | jq -e '.statusCode == 404 or .error' >/dev/null 2>&1; then
       if [ $attempt -lt $max_retries ]; then
         echo "${yellow}Report still generating, retrying in ${retry_delay}s (attempt $attempt/$max_retries)...${reset}" >&2
         sleep $retry_delay
         ((attempt++))
         continue
       fi
+      break
     fi
 
-    # If we get here with valid JSON that's not a 404, break out
+    # Check if response has rich report data (phones, emails, jobs, etc.)
+    # A full report has keys like phones, emails, jobs, possible_associates, etc.
+    # Basic/incomplete data only has: names, locations, tcg_id, data_point_id, provider, searchPointer
+    if echo "$report_response" | jq -e '.phones or .emails or .jobs or .possible_associates or .dobs' >/dev/null 2>&1; then
+      # Full report is ready
+      break
+    fi
+
+    # Got valid JSON but still just basic search data - keep polling
+    if [ $attempt -lt $max_retries ]; then
+      echo "${yellow}Report still populating, retrying in ${retry_delay}s (attempt $attempt/$max_retries)...${reset}" >&2
+      sleep $retry_delay
+      ((attempt++))
+      continue
+    fi
+
+    # Max retries reached, return whatever we have
     break
   done
 
