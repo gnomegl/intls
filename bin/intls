@@ -997,7 +997,90 @@ address)
   api_url="https://$(transform_api_str $API_DOMAIN)/v1/locations?$query_params"
   referer="https://$(transform_api_str $WEB_DOMAIN)/dashboard/search?address=$(urlencode "$argc_street $argc_city $argc_state")"
   response=$(make_request "$api_url" "$referer" "$ACCESS_TOKEN")
+
+  echo "${yellow}Location search results:${reset}" >&2
   filter_json_output "$response"
+
+  # Build record ID: {state}:{city}:{zip}:{street} — all lowercase, spaces stripped
+  local addr_state_lower addr_city_lower addr_street_lower addr_record_id
+  addr_state_lower=$(echo "$argc_state" | tr '[:upper:]' '[:lower:]')
+  addr_city_lower=$(echo "$argc_city" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+  addr_street_lower=$(echo "$argc_street" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+  addr_record_id="${addr_state_lower}:${addr_city_lower}:${argc_zip}:${addr_street_lower}"
+
+  echo "" >&2
+  echo "${yellow}Fetching resident report for ${addr_record_id}...${reset}" >&2
+
+  # Create the address record
+  local addr_record_data
+  addr_record_data=$(jq -nc \
+    --arg street "$argc_street" \
+    --arg city "$argc_city" \
+    --arg state "$argc_state" \
+    --arg zip "$argc_zip" \
+    --arg record_id "$addr_record_id" \
+    '{
+      "data": {
+        "location": {
+          "address": {
+            "street": $street,
+            "city": $city,
+            "state_code": $state,
+            "state": $state,
+            "zip_code": $zip
+          }
+        },
+        "tcg_id": $record_id
+      },
+      "type": "address"
+    }')
+
+  local addr_record_response
+  addr_record_response=$(make_post_request "https://$(transform_api_str $API_DOMAIN)/v1/me/records" \
+    "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$addr_record_id/overview" \
+    "$ACCESS_TOKEN" \
+    "$addr_record_data")
+
+  # Fetch the full report with residents
+  local addr_report_response
+  local max_retries=30
+  local retry_delay=3
+  local attempt=1
+
+  while [ $attempt -le $max_retries ]; do
+    addr_report_response=$(make_request "https://$(transform_api_str $API_DOMAIN)/v1/me/records/$addr_record_id/report?defer_extended_data=false" \
+      "https://$(transform_api_str $WEB_DOMAIN)/dashboard/reports/$addr_record_id/overview" \
+      "$ACCESS_TOKEN")
+
+    # Check for 404 / empty / error — report still generating
+    if [ "$addr_report_response" = "404" ] || [ -z "$addr_report_response" ] || echo "$addr_report_response" | jq -e '.statusCode == 404 or .error' >/dev/null 2>&1; then
+      if [ $attempt -lt $max_retries ]; then
+        echo "${yellow}Report still generating, retrying in ${retry_delay}s (attempt $attempt/$max_retries)...${reset}" >&2
+        sleep $retry_delay
+        ((attempt++))
+        continue
+      fi
+      break
+    fi
+
+    # Check if we got meaningful data (residents, owners, etc.)
+    if echo "$addr_report_response" | jq -e '.residents or .owners or .property_details' >/dev/null 2>&1; then
+      break
+    fi
+
+    # Valid JSON but still populating
+    if [ $attempt -lt $max_retries ]; then
+      echo "${yellow}Report still populating, retrying in ${retry_delay}s (attempt $attempt/$max_retries)...${reset}" >&2
+      sleep $retry_delay
+      ((attempt++))
+      continue
+    fi
+    break
+  done
+
+  echo "" >&2
+  echo "${green}=== Address Report ===${reset}" >&2
+  filter_json_output "$addr_report_response"
   ;;
 
 *)
